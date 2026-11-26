@@ -15,7 +15,7 @@
   <tr><th>发布时间</th><td>{{ active.created_at }}</td></tr>
 </table>
 <table>
-  <tr><th>正文段</th><th>分片号</th><th>成品偏移</th><th>长度</th><th>来源</th><th>正文 SHA-256</th></tr>
+  <tr><th>正文段</th><th>分片号</th><th>成品偏移</th><th>长度</th><th>来源</th><th>正文内偏移</th><th>正文 SHA-256</th></tr>
   {% for s in active.segments %}
   <tr>
     <td>{{ loop.index }}</td>
@@ -23,6 +23,7 @@
     <td>{{ s.offset }}</td>
     <td>{{ s.size }}</td>
     <td class="{{ 'reuse' if s.source == 'reuse' else 'build' }}">{{ '复用整片' if s.source == 'reuse' else '新建拼接' }}</td>
+    <td>{{ s.body_offset }}</td>
     <td class="mono">{{ s.sha256 }}</td>
   </tr>
   {% endfor %}
@@ -49,11 +50,13 @@
 <h2>已收分片（1–{{ max_shards }}）</h2>
 {% if staged %}
 <table>
-  <tr><th>分片号</th><th>大小</th><th>SHA-256</th><th>更新时间</th><th></th></tr>
+  <tr><th>分片号</th><th>大小</th><th>正文内偏移</th><th>来源</th><th>SHA-256</th><th>更新时间</th><th></th></tr>
   {% for s in staged %}
   <tr>
     <td>{{ s.number }}</td>
     <td>{{ s.size }}</td>
+    <td>{{ s.body_offset }}</td>
+    <td>{% if s.origin == 'upload' %}上传{% elif s.origin == 'recovered-reuse' %}找回·复用正文{% else %}找回·另存{% endif %}</td>
     <td class="mono">{{ s.sha256 }}</td>
     <td>{{ s.updated_at }}</td>
     <td>
@@ -66,7 +69,84 @@
   {% endfor %}
 </table>
 {% else %}
-<p class="hint">还没有分片。发布成功后，被发布的分片号会释放，可再上传重用。</p>
+<p class="hint">还没有分片。发布成功后，被发布的分片号会释放，可再上传重用；也可以从当前成品找回。</p>
+{% endif %}
+
+{% if active %}
+<h2>从当前成品找回分片（发布 #{{ active.id }}）</h2>
+<p class="hint">构建机丢失分片原件时，按发布清单从当前成品正文取回对应字节并核对 SHA-256。
+每个分片可<strong>复用所在正文</strong>（不写新字节，多个分片共用同一份正文时只算一次依赖），
+也可<strong>另存</strong>为独立正文（字节计入本次新写额度）。所选分片号被占用、确认时成品已换版、
+校验或写盘失败时整批不补，原有分片照常可用。</p>
+<form method="post" action="{{ url_for('recovery') }}" id="recovery-form">
+  <input type="hidden" name="release_id" value="{{ active.id }}">
+  <table id="recovery-table">
+    <tr><th>勾选</th><th>分片号</th><th>成品偏移</th><th>长度</th><th>所在正文</th><th>正文内偏移 / 整份大小</th><th>SHA-256</th><th>方式</th><th>状态</th></tr>
+    {% for c in recovery_candidates %}
+    <tr class="{{ 'occupied' if c.number in staged_numbers else '' }}"
+        data-size="{{ c.size }}" data-body="{{ c.body_id }}" data-body-size="{{ c.body_size }}">
+      <td><input type="checkbox" name="recover" value="{{ c.number }}"
+                 {% if c.number in staged_numbers %}disabled{% endif %} style="width:auto"></td>
+      <td>{{ c.number }}</td>
+      <td>{{ c.product_offset }}</td>
+      <td>{{ c.size }}</td>
+      <td class="mono">{{ c.body_id[:12] }}…</td>
+      <td>{{ c.body_offset }} / {{ c.body_size }}</td>
+      <td class="mono">{{ c.sha256[:16] }}…</td>
+      <td>
+        <select name="mode_{{ c.number }}" {% if c.number in staged_numbers %}disabled{% endif %}>
+          <option value="reuse">复用正文（0 新写）</option>
+          <option value="copy">另存（新写 {{ c.size }} 字节）</option>
+        </select>
+      </td>
+      <td>{% if c.number in staged_numbers %}<span class="hint">号已占用</span>{% else %}可找回{% endif %}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <div class="grid">
+    <div>
+      <label>本次新写字节上限（限制这次新写的字节数）</label>
+      <input type="number" name="max_new_bytes" min="0" value="0" required>
+    </div>
+    <div>
+      <label>依赖文件总大小上限（共用正文按整份大小算一次）</label>
+      <input type="number" name="max_dependency_bytes" min="0" value="0" required>
+    </div>
+  </div>
+  <p class="hint">按当前勾选与方式预估：新写 <strong id="proj-write">0</strong> 字节；
+  依赖正文合计 <strong id="proj-deps">0</strong> 字节（复用的源正文按整份大小、同一份只算一次；另存不占依赖额度）。
+  服务端会重新独立核算，两项都满足才整批补入，提交后页面显示实际用量。</p>
+  <button type="submit">按清单找回并核对 SHA-256</button>
+</form>
+<script>
+(function () {
+  var form = document.getElementById('recovery-form');
+  if (!form) return;
+  function recalc() {
+    var writeBytes = 0;
+    var depBodies = {};
+    form.querySelectorAll('input[name="recover"]:checked').forEach(function (box) {
+      var row = box.closest('tr');
+      var size = parseInt(row.dataset.size, 10) || 0;
+      var mode = row.querySelector('select').value;
+      if (mode === 'copy') {
+        writeBytes += size;
+      } else {
+        depBodies[row.dataset.body] = parseInt(row.dataset.bodySize, 10) || 0;
+      }
+    });
+    var depBytes = Object.keys(depBodies).reduce(function (acc, k) {
+      return acc + depBodies[k];
+    }, 0);
+    document.getElementById('proj-write').textContent = writeBytes;
+    document.getElementById('proj-deps').textContent = depBytes;
+  }
+  form.addEventListener('change', recalc);
+  recalc();
+})();
+</script>
+{% else %}
+<p class="hint">还没有生效的成品，暂无可找回的分片；先上传分片并发布一次。</p>
 {% endif %}
 
 <h2>上传 / 替换分片</h2>

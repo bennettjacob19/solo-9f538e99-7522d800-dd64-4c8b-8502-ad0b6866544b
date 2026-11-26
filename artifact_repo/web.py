@@ -33,7 +33,9 @@ from .serving import (
 from .store import (
     DigestMismatch,
     NoRelease,
+    RepoError,
     Repo,
+    RecoveryError,
     ValidationError,
     WriteFailure,
 )
@@ -127,17 +129,6 @@ def _unpin_once(repo: Repo, release_id: int):
             log.exception("failed to unpin release %s", release_id)
 
     return unpin
-
-
-def _stream_file(fh):
-    try:
-        while True:
-            block = fh.read(64 * 1024)
-            if not block:
-                break
-            yield block
-    finally:
-        fh.close()
 
 
 def _product_headers(release, status: int, start: int, length: int) -> dict:
@@ -262,9 +253,30 @@ def create_app(repo: Repo, *, simulate_write_failure: bool = False) -> Flask:
     def shard_body(number: int):
         for shard in repo.staged_shards():
             if shard.number == number:
-                fh = open(repo.body_path_for(shard.body_id), "rb")
-                response = Response(
-                    _stream_file(fh),
+                path = repo.body_path_for(shard.body_id)
+
+                def stream_subrange():
+                    # Only the shard's own sub-range is streamed; a body shared
+                    # by several recovered shards never leaks a neighbour's
+                    # bytes into this download.
+                    with open(path, "rb") as fh:
+                        if shard.body_offset:
+                            fh.seek(shard.body_offset)
+                        left = shard.size
+                        try:
+                            while left > 0:
+                                block = fh.read(min(64 * 1024, left))
+                                if not block:
+                                    raise OSError(
+                                        f"分片 {number} 正文在子区间内提前结束"
+                                    )
+                                left -= len(block)
+                                yield block
+                        finally:
+                            pass
+
+                return Response(
+                    stream_with_context(stream_subrange()),
                     mimetype="application/octet-stream",
                     headers={
                         "Content-Length": str(shard.size),
@@ -274,8 +286,6 @@ def create_app(repo: Repo, *, simulate_write_failure: bool = False) -> Flask:
                         ),
                     },
                 )
-                response.call_on_close(fh.close)
-                return response
         abort(404)
 
     # ---------------------------------------------------------------- pages
@@ -297,6 +307,14 @@ def create_app(repo: Repo, *, simulate_write_failure: bool = False) -> Flask:
         trial_start, trial_length = (
             default_trial_range(active) if active is not None else (0, 0)
         )
+        staged_numbers = {s.number for s in repo.staged_shards()}
+        if active is not None:
+            try:
+                candidates = repo.recovery_candidates(active.id)
+            except RepoError:
+                candidates = []
+        else:
+            candidates = []
         return {
             "stats": repo.stats(),
             "staged": repo.staged_shards(),
@@ -310,6 +328,8 @@ def create_app(repo: Repo, *, simulate_write_failure: bool = False) -> Flask:
             else None,
             "trial_start": trial_start,
             "trial_length": trial_length,
+            "recovery_candidates": candidates,
+            "staged_numbers": staged_numbers,
             "flash": request.args.get("msg"),
             "error": request.args.get("err"),
         }
@@ -343,6 +363,85 @@ def create_app(repo: Repo, *, simulate_write_failure: bool = False) -> Flask:
     def delete_shard(number: int):
         repo.delete_staged_shard(number)
         return redirect(url_for("index", msg=f"分片 {number} 已删除"))
+
+    @app.post("/recovery")
+    def recovery():
+        active = repo.get_active_release()
+        if active is None:
+            return redirect(url_for("index", err="尚未发布成品，无法找回分片"))
+        try:
+            numbers = [int(n) for n in request.form.getlist("recover")]
+        except ValueError:
+            return redirect(url_for("index", err="找回分片号必须是整数"))
+        modes = {
+            int(key[len("mode_"):]): value
+            for key, value in request.form.items()
+            if key.startswith("mode_")
+        }
+        # The hidden release id is the version the page was rendered against;
+        # a product swap between render and confirmation is detected against
+        # it inside the serialised recovery transaction.
+        expected_raw = request.form.get("release_id", "").strip()
+        try:
+            expected_id = int(expected_raw) if expected_raw else active.id
+        except ValueError:
+            expected_id = active.id
+        try:
+            max_new = int(request.form.get("max_new_bytes", "").strip(), 10)
+            max_dep = int(
+                request.form.get("max_dependency_bytes", "").strip(), 10
+            )
+        except ValueError:
+            repo.record_attempt(False, "找回：两项上限必须是非负整数", {})
+            return redirect(
+                url_for("index", err="新写字节上限与依赖文件大小上限都必须是非负整数")
+            )
+        started = time.monotonic()
+        try:
+            result = repo.recover_shards(
+                numbers=numbers,
+                modes=modes,
+                max_new_bytes=max_new,
+                max_dependency_bytes=max_dep,
+                expected_release_id=expected_id,
+            )
+        except (ValidationError, RecoveryError, DigestMismatch, WriteFailure, NoRelease) as exc:
+            elapsed = time.monotonic() - started
+            repo.record_attempt(
+                False,
+                f"找回失败：{exc}",
+                {"release_id": expected_id, "elapsed_s": round(elapsed, 3)},
+            )
+            return redirect(
+                url_for("index", err=f"找回失败，整批未补、原有分片照常可用：{exc}")
+            )
+        elapsed = time.monotonic() - started
+        repo.record_attempt(
+            True,
+            f"从发布 #{result.release_id} 找回 {len(result.items)} 个分片",
+            {
+                "release_id": result.release_id,
+                "numbers": [i.number for i in result.items],
+                "new_write_bytes": result.new_write_bytes,
+                "dependency_bytes": result.dependency_bytes,
+                "elapsed_s": round(elapsed, 3),
+            },
+        )
+        detail = "、".join(
+            f"分片 {i.number}（{'复用正文' if i.mode == 'reuse' else '另存'}）"
+            for i in result.items
+        )
+        return redirect(
+            url_for(
+                "index",
+                msg=(
+                    f"已从发布 #{result.release_id} 补入 {len(result.items)} 个分片：{detail}。"
+                    f"实际新写 {result.new_write_bytes} 字节（上限 {max_new}），"
+                    f"依赖正文合计 {result.dependency_bytes} 字节（上限 {max_dep}，"
+                    "共用正文按整份大小只算一次）"
+                ),
+            )
+        )
 
     @app.post("/publish")
     def publish():
@@ -570,9 +669,34 @@ def create_app(repo: Repo, *, simulate_write_failure: bool = False) -> Flask:
                     "hot_checks": active.hot_checks,
                 },
                 "staged": [
-                    {"number": s.number, "size": s.size, "sha256": s.sha256}
+                    {
+                        "number": s.number,
+                        "size": s.size,
+                        "sha256": s.sha256,
+                        "body_offset": s.body_offset,
+                        "origin": s.origin,
+                        "body_id": s.body_id,
+                    }
                     for s in repo.staged_shards()
                 ],
+                "recovery": None
+                if active is None
+                else {
+                    "release_id": active.id,
+                    "candidates": [
+                        {
+                            "number": c.number,
+                            "product_offset": c.product_offset,
+                            "size": c.size,
+                            "sha256": c.sha256,
+                            "body_id": c.body_id,
+                            "body_offset": c.body_offset,
+                            "body_size": c.body_size,
+                            "occupied": c.number in {s.number for s in repo.staged_shards()},
+                        }
+                        for c in repo.recovery_candidates(active.id)
+                    ],
+                },
                 "stats": repo.stats(),
             }
         )

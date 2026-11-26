@@ -37,6 +37,12 @@ class ManifestEntry:
     number: int
     sha256: str
     size: int
+    # Optional pointer into the immutable body that currently stores this
+    # shard's bytes.  Ordinary uploads own a whole body (offset 0); shards
+    # recovered from a published product may share a body and store only a
+    # sub-range of it.
+    body_id: str | None = None
+    body_offset: int = 0
 
 
 @dataclass(frozen=True)
@@ -47,16 +53,32 @@ class HotRange:
 
 
 @dataclass(frozen=True)
+class SegmentRef:
+    """The physical body file (and sub-range) backing one shard."""
+
+    body_id: str
+    body_offset: int = 0
+
+
+@dataclass(frozen=True)
 class SegmentPlan:
     first_number: int
     numbers: tuple[int, ...]
     offset: int
     size: int
     source: str  # "reuse" | "build"
+    # Distinct body files a reader opens for this segment.  A single-shard
+    # segment reusing a shard whose bytes live inside a shared body opens that
+    # one body; a merged segment is materialised as its own new body.
+    refs: tuple[SegmentRef, ...] = ()
 
     @property
     def end(self) -> int:
         return self.offset + self.size
+
+    @property
+    def body_ids(self) -> tuple[str, ...]:
+        return tuple(r.body_id for r in self.refs)
 
 
 @dataclass(frozen=True)
@@ -148,12 +170,32 @@ def _materialise(lengths: Sequence[int], entries: Sequence[ManifestEntry]) -> _C
     pos = 0
     i = 0
     writes = 0
+    build_serial = 0
+    reuse_serial = 0
     for length in lengths:
         block = entries[i : i + length]
         size = sum(e.size for e in block)
         source = "reuse" if length == 1 else "build"
         if source == "build":
             writes += size
+            # A built block becomes its own brand-new body file.  Its real id
+            # is assigned later by the store; a unique placeholder keeps the
+            # distinct-body open-file accounting correct at planning time.
+            build_serial += 1
+            refs: tuple[SegmentRef, ...] = (
+                SegmentRef(f"__build_{build_serial}__", 0),
+            )
+        else:
+            entry = block[0]
+            if entry.body_id:
+                # Real pointer: two adjacent recovered shards sharing one body
+                # genuinely open one file, so they share this id.
+                refs = (SegmentRef(entry.body_id, entry.body_offset),)
+            else:
+                # Ordinary uploads without a shared-body pointer each own a
+                # distinct whole-body file at publish time.
+                reuse_serial += 1
+                refs = (SegmentRef(f"__reuse_{reuse_serial}__", 0),)
         segments.append(
             SegmentPlan(
                 first_number=block[0].number,
@@ -161,6 +203,7 @@ def _materialise(lengths: Sequence[int], entries: Sequence[ManifestEntry]) -> _C
                 offset=pos,
                 size=size,
                 source=source,
+                refs=refs,
             )
         )
         pos += size
@@ -170,7 +213,14 @@ def _materialise(lengths: Sequence[int], entries: Sequence[ManifestEntry]) -> _C
 
 def _opens_for(segments: Sequence[SegmentPlan], hot: HotRange) -> int:
     end = hot.start + hot.length
-    return sum(1 for s in segments if s.offset < end and s.end > hot.start)
+    # A shared body backing several adjacent single-shard segments is opened
+    # only once for one request, so the budget counts distinct body files
+    # intersecting the range rather than intersecting segments.
+    bodies = set()
+    for s in segments:
+        if s.offset < end and s.end > hot.start:
+            bodies.update(s.body_ids)
+    return len(bodies)
 
 
 def enumerate_plans(

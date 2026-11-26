@@ -106,8 +106,15 @@ def intersecting_segments(release: Release, start: int, length: int):
 
 
 def plan_open_count(release: Release, start: int, length: int) -> int:
-    """Distinct body files a request for this range must open."""
-    return len({seg.body_id for seg in intersecting_segments(release, start, length)})
+    """Distinct body files a request for this range must open.
+
+    Two segments may point into the same immutable body (recovered shards
+    sharing one product body); the file is opened only once, so count
+    distinct body ids rather than intersecting segments.
+    """
+    return len(
+        {seg.body_id for seg in intersecting_segments(release, start, length)}
+    )
 
 
 def iter_product_bytes(
@@ -117,7 +124,9 @@ def iter_product_bytes(
 
     Opening every intersecting body up front and closing them together is
     what makes the open-file budget enforceable: at the peak of the read the
-    process holds exactly ``plan_open_count`` handles for this range.
+    process holds exactly ``plan_open_count`` handles for this range.  A body
+    shared by several segments is opened exactly once; each segment then
+    seeks to its own ``body_offset`` and reads only its own bytes.
     """
     hits = intersecting_segments(release, start, length)
     range_end = start + length
@@ -139,7 +148,9 @@ def iter_product_bytes(
             if take <= 0:
                 continue
             fh = handles[repo.body_path_for(seg.body_id)]
-            fh.seek(seg_start - seg.offset)
+            # Seek inside the shared body file: this segment's bytes begin at
+            # body_offset and the requested slice begins further in.
+            fh.seek(seg.body_offset + (seg_start - seg.offset))
             left = take
             while left > 0:
                 block = fh.read(min(STREAM_CHUNK, left))
