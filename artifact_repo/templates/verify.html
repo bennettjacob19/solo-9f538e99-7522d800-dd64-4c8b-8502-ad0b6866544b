@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}试取结果{% endblock %}
+{% block heading %}试取结果{% endblock %}
+{% block body %}
+
+<div class="msg {{ 'ok' if summary.match and summary.status == summary.expected_status else 'err' }}">
+  {{ summary.request }} → HTTP {{ summary.status }}（预期 {{ summary.expected_status }}）
+  {% if summary.match %}，收到的字节与本地成品快照一致{% else %}，字节核对不一致{% endif %}
+</div>
+
+<table>
+  <tr><th>实际打开正文文件数</th><td><strong id="opened">{{ summary.body_files_opened if summary.body_files_opened is not none else '（未能取回服务端计数）' }}</strong>
+    {% if summary.planned_opens is not none %}（按布局计划 {{ summary.planned_opens }}）{% endif %}</td></tr>
+  <tr><th>本次发布新写正文字节数</th><td id="newwrite">{{ summary.release_new_write_bytes }}</td></tr>
+  <tr><th>Content-Range</th><td class="mono">{{ summary.content_range }}</td></tr>
+  <tr><th>Content-Length</th><td>{{ summary.content_length }}</td></tr>
+  <tr><th>收到字节数</th><td>{{ summary.received_bytes }} / 请求 {{ summary.length }}</td></tr>
+  <tr><th>区间 SHA-256（HTTP 收到）</th><td class="mono">{{ summary.http_sha256 }}</td></tr>
+  <tr><th>区间 SHA-256（本地快照）</th><td class="mono">{{ summary.local_sha256 }}</td></tr>
+  <tr><th>发布号</th><td>#{{ summary.release_id }}</td></tr>
+</table>
+
+<h2>本区间触及的正文段</h2>
+<table>
+  <tr><th>分片号</th><th>成品偏移</th><th>长度</th><th>来源</th></tr>
+  {% for s in summary.segments %}
+  <tr><td>{{ s.numbers|join(', ') }}</td><td>{{ s.offset }}</td><td>{{ s.size }}</td>
+      <td class="{{ 'reuse' if s.source == 'reuse' else 'build' }}">{{ '复用整片' if s.source == 'reuse' else '新建拼接' }}</td></tr>
+  {% endfor %}
+</table>
+<p class="hint">试取经回环 TCP 发出真实 HTTP Range 请求；打开文件数与字节统计来自实际服务该请求的读取过程。</p>
+<p><a href="{{ url_for('index') }}">返回概览</a></p>
+{% endblock %}

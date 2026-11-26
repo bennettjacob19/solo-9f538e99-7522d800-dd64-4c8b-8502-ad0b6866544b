@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+{% block title %}制品库 · 概览{% endblock %}
+{% block body %}
+
+<h2>当前成品</h2>
+{% if active %}
+<table>
+  <tr><th>发布号</th><td>#{{ active.id }}</td></tr>
+  <tr><th>文件名</th><td class="mono">{{ active.filename }}</td></tr>
+  <tr><th>稳定下载地址</th><td class="mono"><a href="{{ product_url }}">{{ product_url }}</a>（始终指向当前发布）</td></tr>
+  <tr><th>按文件名访问</th><td class="mono"><a href="{{ url_for('download', name=active.filename) }}">/artifact/{{ active.filename }}</a>（等同稳定地址；该文件名始终指向当时的生效发布）</td></tr>
+  <tr><th>成品大小</th><td>{{ active.total_size }} 字节</td></tr>
+  <tr><th>成品 SHA-256</th><td class="mono">{{ active.product_sha256 }}</td></tr>
+  <tr><th>本发布新写正文</th><td>{{ active.new_write_bytes }} 字节</td></tr>
+  <tr><th>发布时间</th><td>{{ active.created_at }}</td></tr>
+</table>
+<table>
+  <tr><th>正文段</th><th>分片号</th><th>成品偏移</th><th>长度</th><th>来源</th><th>正文 SHA-256</th></tr>
+  {% for s in active.segments %}
+  <tr>
+    <td>{{ loop.index }}</td>
+    <td>{{ s.numbers|join(', ') }}</td>
+    <td>{{ s.offset }}</td>
+    <td>{{ s.size }}</td>
+    <td class="{{ 'reuse' if s.source == 'reuse' else 'build' }}">{{ '复用整片' if s.source == 'reuse' else '新建拼接' }}</td>
+    <td class="mono">{{ s.sha256 }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% if active.hot_checks %}
+<p class="hint">本次发布时常用区间检查：
+{% for c in active.hot_checks %}<span class="pill">{{ c.start }}+{{ c.length }} → {{ c.opens }}/{{ c.max_open }} 个正文</span> {% endfor %}
+</p>
+{% endif %}
+
+<h2>试取实际 HTTP Range</h2>
+<form method="get" action="{{ url_for('verify') }}">
+  <div class="grid">
+    <div><label>起始偏移</label><input type="number" name="start" value="{{ trial_start }}" min="0"></div>
+    <div><label>字节长度</label><input type="number" name="length" value="{{ trial_length }}" min="1"></div>
+  </div>
+  <button type="submit">试取</button>
+</form>
+<p class="hint">经回环 TCP 发出真实 HTTP Range 请求，报告实际打开的正文文件数与本发布新写正文字节数。</p>
+{% else %}
+<p class="hint">还没有生效的成品。上传分片并发布一次。</p>
+{% endif %}
+
+<h2>已收分片（1–{{ max_shards }}）</h2>
+{% if staged %}
+<table>
+  <tr><th>分片号</th><th>大小</th><th>SHA-256</th><th>更新时间</th><th></th></tr>
+  {% for s in staged %}
+  <tr>
+    <td>{{ s.number }}</td>
+    <td>{{ s.size }}</td>
+    <td class="mono">{{ s.sha256 }}</td>
+    <td>{{ s.updated_at }}</td>
+    <td>
+      <form class="inline" method="post" action="{{ url_for('delete_shard', number=s.number) }}">
+        <button type="submit">删除</button>
+      </form>
+      <a href="{{ url_for('shard_body', number=s.number) }}">下载</a>
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% else %}
+<p class="hint">还没有分片。发布成功后，被发布的分片号会释放，可再上传重用。</p>
+{% endif %}
+
+<h2>上传 / 替换分片</h2>
+<form method="post" action="{{ url_for('upload_shards') }}" enctype="multipart/form-data">
+  <div class="grid">
+    <div><label>分片号（1–{{ max_shards }}）</label><input type="number" name="number" min="1" max="{{ max_shards }}" required></div>
+    <div><label>分片文件（同号覆盖）</label><input type="file" name="file" required></div>
+  </div>
+  <button type="submit">上传</button>
+</form>
+
+<h2>发布</h2>
+<form method="post" action="{{ url_for('publish') }}">
+  <div class="grid">
+    <div>
+      <label>成品文件名</label>
+      <input type="text" name="filename" value="{{ active.filename if active else 'install.img' }}">
+      <label>成品顺序清单（每行：分片号 SHA-256）</label>
+      <textarea name="manifest" spellcheck="false">{{ prefill }}</textarea>
+      <p class="hint">按成品顺序列出；摘要须与已收分片一致。整片可复用，相邻整片可合并为新正文文件。</p>
+    </div>
+    <div>
+      <label>常用字节区间（每行：起始偏移 长度 最多打开正文文件数）</label>
+      <textarea name="hot" spellcheck="false" placeholder="0 1048576 1&#10;8388608 4194304 2"></textarea>
+      <label>本次发布新写正文总字节上限</label>
+      <input type="number" name="max_write" min="0" value="0">
+      <label><input type="checkbox" name="simulate_failure" style="width:auto"> 模拟写盘失败（演练回滚）</label>
+      <p class="hint">两项额度有解才发布。失败时保留旧成品与已收分片。</p>
+    </div>
+  </div>
+  <button type="submit">发布</button>
+</form>
+
+<h2>发布记录</h2>
+<table>
+  <tr><th>#</th><th>文件名</th><th>字节</th><th>新写</th><th>状态</th><th>创建</th><th>退役</th><th>在途读者</th></tr>
+  {% for r in releases %}
+  <tr>
+    <td>{{ r.id }}</td>
+    <td class="mono">{{ r.filename }}</td>
+    <td>{{ r.total_size }}</td>
+    <td>{{ r.new_write_bytes }}</td>
+    <td>{{ '生效中' if r.is_active else '已退役' }}</td>
+    <td>{{ r.created_at }}</td>
+    <td>{{ r.retired_at or '—' }}</td>
+    <td>{{ r.pinned_readers }}</td>
+  </tr>
+  {% else %}
+  <tr><td colspan="8" class="hint">暂无发布</td></tr>
+  {% endfor %}
+</table>
+<form method="post" action="{{ url_for('gc') }}"><button type="submit">回收无引用正文（手动触发）</button></form>
+
+<h2>最近发布尝试</h2>
+<table>
+  <tr><th>时间</th><th>结果</th><th>说明</th></tr>
+  {% for a in attempts %}
+  <tr><td>{{ a.created_at }}</td><td>{{ '成功' if a.ok else '失败' }}</td><td>{{ a.message }}</td></tr>
+  {% else %}
+  <tr><td colspan="3" class="hint">暂无</td></tr>
+  {% endfor %}
+</table>
+
+<h2>存储概览</h2>
+<table>
+  <tr><th>正文文件</th><td>{{ stats.bodies }} 个，{{ stats.body_bytes }} 字节</td></tr>
+  <tr><th>已收分片</th><td>{{ stats.staged_shards }} 个</td></tr>
+  <tr><th>发布总数</th><td>{{ stats.releases }}（其中已退役 {{ stats.retired_releases }}）</td></tr>
+  <tr><th>数据目录</th><td class="mono">{{ stats.data_dir }}</td></tr>
+</table>
+{% endblock %}

@@ -1,0 +1,17 @@
+services:
+  artifact-repo:
+    build: .
+    image: artifact-repo:local
+    container_name: artifact-repo
+    ports:
+      - "8000:8000"
+    environment:
+      ARTIFACT_DATA_DIR: /data
+      # Set to 1 to make every publish fail its merge write, for rollback drills.
+      ARTIFACT_SIMULATE_WRITE_FAILURE: "0"
+    volumes:
+      - artifact-data:/data
+    restart: unless-stopped
+
+volumes:
+  artifact-data:
